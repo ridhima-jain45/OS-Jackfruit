@@ -128,6 +128,11 @@ typedef struct {
     container_record_t *containers;
 } supervisor_ctx_t;
 
+typedef struct {
+    int fd;
+    supervisor_ctx_t *ctx;
+    char id[CONTAINER_ID_LEN];
+} producer_arg_t;
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -277,7 +282,26 @@ static void bounded_buffer_begin_shutdown(bounded_buffer_t *buffer)
     pthread_cond_broadcast(&buffer->not_full);
     pthread_mutex_unlock(&buffer->mutex);
 }
+void *producer_thread(void *arg)
+{
+    producer_arg_t *p = arg;
+    char buf[LOG_CHUNK_SIZE];
 
+    while (1) {
+        int n = read(p->fd, buf, sizeof(buf));
+        if (n <= 0) break;
+
+        log_item_t item;
+        strcpy(item.container_id, p->id);
+        memcpy(item.data, buf, n);
+        item.length = n;
+
+        bounded_buffer_push(&p->ctx->log_buffer, &item);
+    }
+
+    close(p->fd);
+    return NULL;
+}
 /*
  * TODO:
  * Implement producer-side insertion into the bounded buffer.
@@ -289,11 +313,24 @@ static void bounded_buffer_begin_shutdown(bounded_buffer_t *buffer)
  */
 int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
-}
+    pthread_mutex_lock(&buffer->mutex);
 
+    while (buffer->count == LOG_BUFFER_CAPACITY && !buffer->shutting_down)
+        pthread_cond_wait(&buffer->not_full, &buffer->mutex);
+
+    if (buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    buffer->items[buffer->tail] = *item;
+    buffer->tail = (buffer->tail + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count++;
+
+    pthread_cond_signal(&buffer->not_empty);
+    pthread_mutex_unlock(&buffer->mutex);
+    return 0;
+}
 /*
  * TODO:
  * Implement consumer-side removal from the bounded buffer.
@@ -303,13 +340,26 @@ int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
  *   - return a useful status when shutdown is in progress
  *   - avoid races with producers and shutdown
  */
-int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
+int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
-}
+    pthread_mutex_lock(&buffer->mutex);
 
+    while (buffer->count == LOG_BUFFER_CAPACITY && !buffer->shutting_down)
+        pthread_cond_wait(&buffer->not_full, &buffer->mutex);
+
+    if (buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    buffer->items[buffer->tail] = *item;
+    buffer->tail = (buffer->tail + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count++;
+
+    pthread_cond_signal(&buffer->not_empty);
+    pthread_mutex_unlock(&buffer->mutex);
+    return 0;
+}
 /*
  * TODO:
  * Implement the logging consumer thread.
@@ -321,7 +371,22 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
  */
 void *logging_thread(void *arg)
 {
-    (void)arg;
+    supervisor_ctx_t *ctx = arg;
+    log_item_t item;
+
+    mkdir(LOG_DIR, 0755);
+
+    while (bounded_buffer_pop(&ctx->log_buffer, &item) == 0) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s.log", LOG_DIR, item.container_id);
+
+        FILE *f = fopen(path, "a");
+        if (f) {
+            fwrite(item.data, 1, item.length, f);
+            fclose(f);
+        }
+    }
+
     return NULL;
 }
 
@@ -338,7 +403,22 @@ void *logging_thread(void *arg)
  */
 int child_fn(void *arg)
 {
-    (void)arg;
+    child_config_t *cfg = arg;
+
+    sethostname(cfg->id, strlen(cfg->id));
+
+    chroot(cfg->rootfs);
+    chdir("/");
+
+    mount("proc", "/proc", "proc", 0, NULL);
+
+    dup2(cfg->log_write_fd, STDOUT_FILENO);
+    dup2(cfg->log_write_fd, STDERR_FILENO);
+    close(cfg->log_write_fd);
+
+    execl("/bin/sh", "sh", "-c", cfg->command, NULL);
+
+    perror("exec");
     return 1;
 }
 
@@ -419,6 +499,70 @@ static int run_supervisor(const char *rootfs)
      *   4) spawn the logger thread
      *   5) enter the supervisor event loop
      */
+    unlink(CONTROL_PATH);
+
+ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+struct sockaddr_un addr = {0};
+addr.sun_family = AF_UNIX;
+strcpy(addr.sun_path, CONTROL_PATH);
+
+bind(ctx.server_fd, (struct sockaddr *)&addr, sizeof(addr));
+listen(ctx.server_fd, 5);
+
+pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx);
+
+printf("[Supervisor] Listening on %s\n", CONTROL_PATH);
+
+while (1) {
+    int client = accept(ctx.server_fd, NULL, NULL);
+
+    control_request_t req;
+    read(client, &req, sizeof(req));
+
+    if (req.kind == CMD_START) {
+        int pipefd[2];
+        pipe(pipefd);
+
+        child_config_t *cfg = malloc(sizeof(child_config_t));
+        strcpy(cfg->id, req.container_id);
+        strcpy(cfg->rootfs, req.rootfs);
+        strcpy(cfg->command, req.command);
+        cfg->log_write_fd = pipefd[1];
+
+        char *stack = malloc(STACK_SIZE);
+
+        pid_t pid = clone(child_fn, stack + STACK_SIZE,
+                          CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
+                          cfg);
+
+        close(pipefd[1]);
+
+        container_record_t *rec = malloc(sizeof(container_record_t));
+        strcpy(rec->id, req.container_id);
+        rec->host_pid = pid;
+        rec->started_at = time(NULL);
+        rec->state = CONTAINER_RUNNING;
+        snprintf(rec->log_path, PATH_MAX, "logs/%s.log", req.container_id);
+
+        pthread_mutex_lock(&ctx.metadata_lock);
+        rec->next = ctx.containers;
+        ctx.containers = rec;
+        pthread_mutex_unlock(&ctx.metadata_lock);
+
+        pthread_t producer;
+        producer_arg_t *parg = malloc(sizeof(producer_arg_t));
+        parg->fd = pipefd[0];
+        parg->ctx = &ctx;
+        strcpy(parg->id, req.container_id);
+
+        pthread_create(&producer, NULL, producer_thread, parg);
+
+        printf("[Supervisor] Started %s PID %d\n", req.container_id, pid);
+    }
+
+    close(client);
+}
     fprintf(stderr, "Supervisor mode not implemented yet for base-rootfs: %s\n", rootfs);
 
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
@@ -437,9 +581,17 @@ static int run_supervisor(const char *rootfs)
  */
 static int send_control_request(const control_request_t *req)
 {
-    (void)req;
-    fprintf(stderr, "Control-plane client path not implemented.\n");
-    return 1;
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, CONTROL_PATH);
+
+    connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+    write(sock, req, sizeof(*req));
+
+    close(sock);
+    return 0;
 }
 
 static int cmd_start(int argc, char *argv[])
