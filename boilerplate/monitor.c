@@ -1,31 +1,31 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/fs.h>
-#include <linux/uaccess.h>
-#include <linux/slab.h>
-#include <linux/sched/signal.h>
-#include <linux/mm.h>
-#include <linux/list.h>
-#include <linux/mutex.h>
-
+#include <linux/init.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
+#include <linux/sched/signal.h>
+#include <linux/mm.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/fs.h>
+#include <linux/mutex.h>
+#include <linux/list.h>
 
 #include "monitor_ioctl.h"
 
-#define DEVICE_NAME "container_monitor"
-
-#define SOFT_LIMIT_KB (100 * 1024)   // 100 MB
-#define HARD_LIMIT_KB (200 * 1024)   // 200 MB
-
 MODULE_LICENSE("GPL");
+MODULE_AUTHOR("You");
+MODULE_DESCRIPTION("Container Memory Monitor");
 
 /* ========================= */
-/*  Data Structures        */
+/*  Data Structures          */
 /* ========================= */
 
 struct pid_entry {
     pid_t pid;
+    unsigned long soft_limit;
+    unsigned long hard_limit;
+    char container_id[32];
     struct list_head list;
 };
 
@@ -36,7 +36,7 @@ static int major;
 static struct task_struct *monitor_thread;
 
 /* ========================= */
-/* Memory Usage Function  */
+/* Memory Usage Function     */
 /* ========================= */
 
 static unsigned long get_mem_usage_kb(pid_t pid)
@@ -55,7 +55,7 @@ static unsigned long get_mem_usage_kb(pid_t pid)
 }
 
 /* ========================= */
-/*  Kill Process           */
+/* Kill Process              */
 /* ========================= */
 
 static void kill_process(pid_t pid)
@@ -66,13 +66,13 @@ static void kill_process(pid_t pid)
     task = pid_task(find_vpid(pid), PIDTYPE_PID);
     if (task) {
         send_sig(SIGKILL, task, 0);
-        printk(KERN_INFO "[monitor] Killed PID %d\n", pid);
+        printk(KERN_ALERT "[monitor] Killed PID %d\n", pid);
     }
     rcu_read_unlock();
 }
 
 /* ========================= */
-/*  Monitor Loop           */
+/* Monitor Loop              */
 /* ========================= */
 
 static int monitor_fn(void *data)
@@ -84,16 +84,16 @@ static int monitor_fn(void *data)
         mutex_lock(&pid_mutex);
 
         list_for_each_entry(entry, &pid_list, list) {
-            unsigned long mem = get_mem_usage_kb(entry->pid);
+            unsigned long mem_kb = get_mem_usage_kb(entry->pid);
 
-            if (mem > HARD_LIMIT_KB) {
-                printk(KERN_ALERT "[monitor] PID %d exceeded HARD limit (%lu KB)\n",
-                       entry->pid, mem);
+            if (mem_kb > (entry->hard_limit >> 10)) {
+                printk(KERN_ALERT "[monitor] PID %d (%s) exceeded HARD limit (%lu KB)\n",
+                       entry->pid, entry->container_id, mem_kb);
                 kill_process(entry->pid);
-            } 
-            else if (mem > SOFT_LIMIT_KB) {
-                printk(KERN_WARNING "[monitor] PID %d exceeded SOFT limit (%lu KB)\n",
-                       entry->pid, mem);
+            }
+            else if (mem_kb > (entry->soft_limit >> 10)) {
+                printk(KERN_WARNING "[monitor] PID %d (%s) exceeded SOFT limit (%lu KB)\n",
+                       entry->pid, entry->container_id, mem_kb);
             }
         }
 
@@ -106,57 +106,68 @@ static int monitor_fn(void *data)
 }
 
 /* ========================= */
-/*  IOCTL Handler          */
+/* IOCTL Handler             */
 /* ========================= */
 
 static long monitor_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    pid_t pid;
+    struct monitor_request req;
     struct pid_entry *entry, *tmp;
 
-    if (copy_from_user(&pid, (pid_t __user *)arg, sizeof(pid)))
+    if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
         return -EFAULT;
 
     switch (cmd) {
 
-        case REGISTER_PID:
-            entry = kmalloc(sizeof(*entry), GFP_KERNEL);
-            if (!entry)
-                return -ENOMEM;
+    case MONITOR_REGISTER:
+        entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+        if (!entry)
+            return -ENOMEM;
 
-            entry->pid = pid;
+        entry->pid = req.pid;
+        entry->soft_limit = req.soft_limit_bytes;
+        entry->hard_limit = req.hard_limit_bytes;
+        strncpy(entry->container_id, req.container_id, sizeof(entry->container_id));
 
-            mutex_lock(&pid_mutex);
-            list_add(&entry->list, &pid_list);
-            mutex_unlock(&pid_mutex);
+        mutex_lock(&pid_mutex);
+        list_add(&entry->list, &pid_list);
+        mutex_unlock(&pid_mutex);
 
-            printk(KERN_INFO "[monitor] Registered PID %d\n", pid);
-            break;
+        printk(KERN_INFO "[monitor] Registered PID %d (%s)\n",
+               req.pid, req.container_id);
+        break;
 
-        case UNREGISTER_PID:
-            mutex_lock(&pid_mutex);
+    case MONITOR_UNREGISTER:
+    {
+        int found = 0;
 
-            list_for_each_entry_safe(entry, tmp, &pid_list, list) {
-                if (entry->pid == pid) {
-                    list_del(&entry->list);
-                    kfree(entry);
-                    printk(KERN_INFO "[monitor] Unregistered PID %d\n", pid);
-                    break;
-                }
+        mutex_lock(&pid_mutex);
+
+        list_for_each_entry_safe(entry, tmp, &pid_list, list) {
+            if (entry->pid == req.pid) {
+                list_del(&entry->list);
+                kfree(entry);
+                printk(KERN_INFO "[monitor] Unregistered PID %d (%s)\n",
+                       req.pid, req.container_id);
+                found = 1;
+                break;
             }
+        }
 
-            mutex_unlock(&pid_mutex);
-            break;
+        mutex_unlock(&pid_mutex);
 
-        default:
-            return -EINVAL;
+        return found ? 0 : -ENOENT;
+    }
+
+    default:
+        return -EINVAL;
     }
 
     return 0;
 }
 
 /* ========================= */
-/*  File Operations        */
+/* File Operations           */
 /* ========================= */
 
 static struct file_operations fops = {
@@ -165,7 +176,7 @@ static struct file_operations fops = {
 };
 
 /* ========================= */
-/*  Init                   */
+/* Init                      */
 /* ========================= */
 
 static int __init monitor_init(void)
@@ -178,7 +189,6 @@ static int __init monitor_init(void)
 
     printk(KERN_INFO "[monitor] Device registered with major %d\n", major);
 
-    /* Start monitoring thread */
     monitor_thread = kthread_run(monitor_fn, NULL, "monitor_thread");
     if (IS_ERR(monitor_thread)) {
         unregister_chrdev(major, DEVICE_NAME);
@@ -191,18 +201,16 @@ static int __init monitor_init(void)
 }
 
 /* ========================= */
-/*  Exit                   */
+/* Exit                      */
 /* ========================= */
 
 static void __exit monitor_exit(void)
 {
     struct pid_entry *entry, *tmp;
 
-    /* Stop thread */
     if (monitor_thread)
         kthread_stop(monitor_thread);
 
-    /* Cleanup list */
     mutex_lock(&pid_mutex);
     list_for_each_entry_safe(entry, tmp, &pid_list, list) {
         list_del(&entry->list);
@@ -217,4 +225,3 @@ static void __exit monitor_exit(void)
 
 module_init(monitor_init);
 module_exit(monitor_exit);
-
