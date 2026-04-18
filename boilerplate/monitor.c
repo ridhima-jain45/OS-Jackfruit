@@ -20,6 +20,7 @@
  *   ls -l /dev/container_monitor
  */
 
+#include <linux/version.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -273,8 +274,14 @@ static int __init monitor_init(void)
     }
     pr_info("[monitor] registered with major number %d\n", major_number);
 
-    /* 2. Create device class (visible under /sys/class/) */
+    /* 2. Create device class (visible under /sys/class/)
+     * Kernel 6.4+ changed class_create() to take only the name argument.
+     * Older kernels need THIS_MODULE as the first argument.             */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    monitor_class = class_create(DEVICE_NAME);
+#else
     monitor_class = class_create(THIS_MODULE, DEVICE_NAME);
+#endif
     if (IS_ERR(monitor_class)) {
         unregister_chrdev(major_number, DEVICE_NAME);
         pr_alert("[monitor] failed to create device class\n");
