@@ -131,12 +131,6 @@ sudo ./engine ps
 sudo ./engine logs alpha
 ```
 
-#### Run a workload and block until it finishes
-
-```bash
-sudo ./engine run worker ./rootfs-alpha "/cpu_hog 20" --nice 5
-```
-
 #### Stop a container
 
 ```bash
