@@ -179,6 +179,24 @@ sleep 32
 sudo ./engine logs cpu-hi
 sudo ./engine logs cpu-lo
 ```
+```
+# Make rootfs copies for the io experiment
+cp -a ./rootfs-base ./rootfs-iopulse
+cp ./io_pulse ./rootfs-iopulse/
+cp -a ./rootfs-base ./rootfs-cpuexp
+cp ./cpu_hog ./rootfs-cpuexp/
+
+# Start both at the same time
+sudo ./engine start cpuhog  ./rootfs-cpuexp  "/cpu_hog 30"
+sudo ./engine start iopulse ./rootfs-iopulse "/io_pulse 20 200"
+
+# Wait for both to finish
+sleep 35
+
+# Check the logs
+sudo ./engine logs cpuhog
+sudo ./engine logs iopulse
+```
 
 ### 2.9 Clean Teardown
 
@@ -214,7 +232,7 @@ rm -rf rootfs-alpha rootfs-beta rootfs-memtest rootfs-hardtest rootfs-cpuhi root
 | 4 | **CLI and IPC** | `engine stop alpha` sent from Terminal 2; supervisor Terminal 1 simultaneously prints the stop acknowledgement, demonstrating the UNIX domain socket control channel (Path B). |
 | 5 | **Soft-limit warning** | `dmesg` showing `[monitor] SOFT LIMIT exceeded: pid=4792 container=memtest rss=25216kB limit=20MiB` — the kernel module detected RSS crossing the 20 MiB soft threshold and logged a warning. |
 | 6 | **Hard-limit enforcement** | `dmesg` showing `[monitor] HARD LIMIT: killed pid=4792 container=memtest` and `engine ps` showing state=`killed` reason=`hard_limit_killed` — the kernel module sent SIGKILL when RSS exceeded 32 MiB. |
-| 7 | **Scheduling experiment** | `engine logs cpu-hi` (nice=-10) and `engine logs cpu-lo` (nice=+10) both complete 30 seconds. The accumulator values differ between the two, reflecting different CPU time allocations by the CFS scheduler. |
+| 7 | **Scheduling experiment** | `engine logs cpu-hi` (nice=-10) and `engine logs cpu-lo` (nice=+10) both complete 30 seconds. The accumulator values differ between the two, reflecting different CPU time allocations by the CFS scheduler. and I/O Bound processes |
 | 8 | **Clean teardown** | `ps aux` showing no remaining engine processes after supervisor SIGTERM. `dmesg` confirms `[monitor] module unloaded` after `rmmod monitor`. Supervisor printed `[supervisor] clean exit.` in Terminal 1. |
 
 ---
@@ -254,6 +272,15 @@ rm -rf rootfs-alpha rootfs-beta rootfs-memtest rootfs-hardtest rootfs-cpuhi root
 <br><br>
 <img width="940" height="116" alt="image" src="https://github.com/user-attachments/assets/545cecad-bb91-4276-9e97-1eb57b24132c" />
 <br><br>
+<img width="973" height="681" alt="Screenshot 2026-04-20 182608" src="https://github.com/user-attachments/assets/2c8a3666-ec1d-43c3-8fcf-555cfcf07ae0" />
+<br><br>
+
+<img width="1030" height="677" alt="image" src="https://github.com/user-attachments/assets/1de2cf52-9bf4-41c4-8b3e-b72a3af9cbeb" />
+<br><br>
+<img width="642" height="73" alt="image" src="https://github.com/user-attachments/assets/be135953-d45c-42ed-b0cb-cc2e6f905a84" />
+<br><br>
+
+
 <img width="940" height="257" alt="image" src="https://github.com/user-attachments/assets/a898f380-8ac4-4086-816f-07c1c2ddffcf" />
 <br><br>
 
